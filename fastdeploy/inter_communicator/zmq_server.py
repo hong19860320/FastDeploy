@@ -17,6 +17,8 @@
 import os
 import threading
 import time
+import pickle
+import traceback
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from multiprocessing.reduction import ForkingPickler
@@ -184,6 +186,9 @@ class ZmqServerBase(ABC):
             return None, self.recv_json(flags=flags)
         except zmq.Again:
             return None, None
+        except (UnicodeDecodeError, ValueError) as e:
+            llm_logger.warning(f"receive_json_once: invalid message dropped: {e}")
+            return None, None
         except Exception as e:
             self.close()
             llm_logger.warning(f"{e}")
@@ -200,6 +205,9 @@ class ZmqServerBase(ABC):
             flags = zmq.NOBLOCK if not block else 0
             return None, self.recv_pyobj(flags=flags)
         except zmq.Again:
+            return None, None
+        except (UnicodeDecodeError, ValueError, pickle.UnpicklingError) as e:
+            llm_logger.warning(f"receive_pyobj_once: invalid message dropped: {e}")
             return None, None
         except Exception as e:
             self.close()
@@ -231,10 +239,10 @@ class ZmqServerBase(ABC):
                 time.sleep(0.001)
                 continue
             except zmq.error.ZMQError as e:
-                llm_logger.error(f"recv_result_handle get zmq error: {e}")
+                llm_logger.error(f"recv_result_handle get zmq error: {e}, {traceback.format_exc()}")
                 break
             except Exception as e:
-                llm_logger.error(f"recv_result_handle get unknown exception: {e}")
+                llm_logger.error(f"recv_result_handle get unknown exception: {e}, {traceback.format_exc()}")
                 continue
 
     def _send_response_per_step(self, batch_id, data):
@@ -267,7 +275,7 @@ class ZmqServerBase(ABC):
                 self.batch_id_per_step += 1
 
             except Exception as e:
-                llm_logger.error(f"Send result to zmq client failed: {e}")
+                llm_logger.error(f"Send result to zmq client failed: {e}, {traceback.format_exc()}")
 
     def _send_response_per_query(self, req_id, data):
         """
@@ -318,7 +326,7 @@ class ZmqServerBase(ABC):
                 )
 
             except Exception as e:
-                llm_logger.error(f"Send result to zmq client failed: {e}")
+                llm_logger.error(f"Send result to zmq client failed: {e}, {traceback.format_exc()}")
 
         if data and data[-1].finished:
             with self.mutex:
@@ -368,7 +376,7 @@ class ZmqServerBase(ABC):
             )
 
         except Exception as e:
-            llm_logger.error(f"Send batch response to worker {worker_pid} failed: {e}")
+            llm_logger.error(f"Send batch response to worker {worker_pid} failed: {e}, {traceback.format_exc()}")
 
     def send_response(self, req_id, data, worker_pid=None):
         """
@@ -480,14 +488,15 @@ class ZmqIpcServer(ZmqServerBase):
             return
 
         self.running = False
-        llm_logger.info("ZMQ server is closing connection...")
+        llm_logger.info(":q.")
         try:
             # Close per-worker PUSH sockets (batch mode)
             with self.worker_push_lock:
                 for wpid, sock in self.worker_push_sockets.items():
                     try:
                         sock.close()
-                    except Exception:
+                    except Exception as e:
+                        llm_logger.warning(f"Failed to close worker push socket {wpid} - {e}")
                         pass
                 self.worker_push_sockets.clear()
                 self.worker_push_addresses.clear()
@@ -538,7 +547,13 @@ class ZmqTcpServer(ZmqServerBase):
         """
         self._ensure_socket()
         try:
-            client, _, task_data = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+            # client, _, task_data = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+            frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+            if len(frames) < 2:
+                llm_logger.warning(f"recv_control_cmd: unexpected frame count {len(frames)}, dropping message")
+                return None
+            client = frames[0]
+            task_data = frames[-1]
             task = msgpack.unpackb(task_data)
             task_id_str = task["task_id"]
         except zmq.Again:
@@ -559,7 +574,7 @@ class ZmqTcpServer(ZmqServerBase):
             self.socket.send_multipart([self.req_dict[task_id], b"", result])
 
         except Exception as e:
-            llm_logger.error(f"Send result to zmq client failed: {e}")
+            llm_logger.error(f"Send result to zmq client failed: {e}, {traceback.format_exc()}")
 
         with self.mutex:
             self.req_dict.pop(task_id, None)
